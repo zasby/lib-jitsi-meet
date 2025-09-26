@@ -134,6 +134,14 @@ export interface IConferenceOptions {
             lastNRampupTime?: number;
             p2pTestMode?: boolean;
         };
+        /**
+         * Mesh P2P (экспериментальный режим): многосессионный P2P без JVB.
+         * enabled: включает режим, maxPeers: максимум пиров (без себя), дефолт 5.
+         */
+        meshP2P?: {
+            enabled?: boolean;
+            maxPeers?: number;
+        };
         transcriptionLanguage?: string;
         videoQuality?: {
             codecPreferenceOrder?: string[];
@@ -468,9 +476,18 @@ export default class JitsiConference extends Listenable {
 
         /**
          * A JingleSession for the direct peer to peer connection.
+         * В mesh-режиме не используется.
          * @type {JingleSessionPC}
          */
         this.p2pJingleSession = null;
+
+        /**
+         * Набор P2P-сессий для каждого удалённого участника в mesh-режиме.
+         * Ключ — remoteJid.
+         * @type {Map<string, JingleSessionPC>}
+         */
+        // @ts-ignore - поле добавлено для экспериментального режима
+        this.p2pSessions = new Map();
 
         this.videoSIPGWHandler = new VideoSIPGW(this.room);
         this.recordingManager = new RecordingManager(this.room);
@@ -955,7 +972,7 @@ export default class JitsiConference extends Listenable {
     private async _doReplaceTrack(oldTrack?: JitsiLocalTrack, newTrack?: JitsiLocalTrack): Promise<void> {
         const replaceTrackPromises = [];
 
-        if (this.jvbJingleSession) {
+        if (this.jvbJingleSession && !(this._isMeshEnabled && this._isMeshEnabled())) {
             replaceTrackPromises.push(this.jvbJingleSession.replaceTrack(oldTrack, newTrack));
         } else {
             logger.info('_doReplaceTrack - no JVB JingleSession');
@@ -965,6 +982,15 @@ export default class JitsiConference extends Listenable {
             replaceTrackPromises.push(this.p2pJingleSession.replaceTrack(oldTrack, newTrack));
         } else {
             logger.info('_doReplaceTrack - no P2P JingleSession');
+        }
+
+        // Mesh: заменить трек во всех активных p2p-сессиях
+        if (this._isMeshEnabled && this._isMeshEnabled()) {
+            // @ts-ignore
+            const activeMap: Map<string, any> = this.p2pSessions as any;
+            for (const session of activeMap.values()) {
+                replaceTrackPromises.push(session.replaceTrack(oldTrack, newTrack));
+            }
         }
 
         await Promise.all(replaceTrackPromises);
@@ -1261,6 +1287,15 @@ export default class JitsiConference extends Listenable {
      * @private
      */
     private _maybeStartOrStopP2P(userLeftEvent: boolean = false): void {
+        // Mesh-ветка: если включён meshP2P — управляем множественными P2P сессиями
+        // @ts-ignore экспериментальный режим
+        if (this._isMeshEnabled && this._isMeshEnabled()) {
+            // @ts-ignore экспериментальный режим
+            this._maybeUpdateMeshSessions && this._maybeUpdateMeshSessions();
+
+            return;
+        }
+
         if (!this.isP2PEnabled()
                 || this.isP2PTestModeEnabled()
                 || (browser.isFirefox() && !this._firefoxP2pEnabled)
@@ -1328,6 +1363,146 @@ export default class JitsiConference extends Listenable {
                     createP2PEvent(AnalyticsEvents.ACTION_P2P_SWITCH_TO_JVB));
             }
             this._stopP2PSession();
+        }
+    }
+
+    // ===== Mesh helpers (экспериментальный режим) =====
+    // @ts-ignore приватные экспериментальные методы
+    private _isMeshEnabled(): boolean {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+        return Boolean(this.options?.config?.meshP2P?.enabled);
+    }
+
+    // @ts-ignore приватные экспериментальные методы
+    private _getMeshMaxPeers(): number {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+        const val = this.options?.config?.meshP2P?.maxPeers as unknown as number | undefined;
+
+        return isValidNumber(val) ? Number(val) : 5;
+    }
+
+    // @ts-ignore приватные экспериментальные методы
+    private _shouldInitiateWith(remoteJid: string): boolean {
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+            const my = String(this.room?.myroomjid || '');
+            const other = String(remoteJid || '');
+
+            return my.localeCompare(other) < 0;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // @ts-ignore приватные экспериментальные методы
+    private _maybeUpdateMeshSessions(): void {
+        // @ts-ignore поле p2pSessions добавлено экспериментально
+        const activeMap: Map<string, any> = this.p2pSessions as any;
+        const peers = this.getParticipants();
+        const currentPeersJids = new Set(peers.map(p => p.getJid()));
+        const maxPeers = this._getMeshMaxPeers();
+
+        // Удалить сессии для ушедших пиров
+        for (const [remoteJid] of activeMap) {
+            if (!currentPeersJids.has(remoteJid)) {
+                // @ts-ignore
+                this._teardownP2PSessionWith && this._teardownP2PSessionWith(remoteJid, { reason: 'unavailable', reasonDescription: 'peer left' });
+            }
+        }
+
+        // Создать недостающие сессии, соблюдая лимит и роль инициатора
+        for (const peer of peers) {
+            const remoteJid = peer.getJid();
+
+            if (!remoteJid || activeMap.has(remoteJid)) {
+                continue;
+            }
+            if (activeMap.size >= maxPeers) {
+                break;
+            }
+            if (this._shouldInitiateWith(remoteJid)) {
+                // @ts-ignore
+                this._ensureP2PSessionWith && this._ensureP2PSessionWith(remoteJid);
+            }
+        }
+    }
+
+    // @ts-ignore приватные экспериментальные методы
+    private _ensureP2PSessionWith(remoteJid: string): void {
+        if (!remoteJid) {
+            return;
+        }
+        // @ts-ignore
+        const activeMap: Map<string, any> = this.p2pSessions as any;
+        if (activeMap.has(remoteJid)) {
+            return;
+        }
+
+        const session = this.xmpp.connection.jingle.newP2PJingleSession(
+            // @ts-ignore
+            this.room.myroomjid,
+            remoteJid
+        );
+
+        logger.info('Mesh: Created P2P JingleSession',
+            // @ts-ignore
+            this.room.myroomjid, remoteJid);
+
+        session.initialize(
+            // @ts-ignore
+            this.room,
+            this.rtc,
+            this._signalingLayer,
+            {
+                ...this.options.config,
+                codecSettings: {
+                    codecList: this.qualityController.codecController.getCodecPreferenceList('p2p'),
+                    mediaType: MediaType.VIDEO,
+                    screenshareCodec: this.qualityController.codecController.getScreenshareCodec('p2p')
+                },
+                enableInsertableStreams: this.isE2EEEnabled() || FeatureFlags.isRunInLiteModeEnabled()
+            }
+        );
+
+        const localTracks = this.getLocalTracks();
+
+        activeMap.set(remoteJid, session);
+
+        session.invite(localTracks).then(() => {
+            session.addEventListener(MediaSessionEvents.VIDEO_CODEC_CHANGED, () => {
+                this.eventEmitter.emit(JitsiConferenceEvents.VIDEO_CODEC_CHANGED);
+            });
+        }).catch(error => {
+            logger.error('Mesh: Failed to start P2P Jingle session', error);
+            // @ts-ignore
+            this._teardownP2PSessionWith && this._teardownP2PSessionWith(remoteJid, {
+                reason: 'failed-transport',
+                reasonDescription: 'mesh session invite failed'
+            });
+        });
+    }
+
+    // @ts-ignore приватные экспериментальные методы
+    private _teardownP2PSessionWith(remoteJid: string, {
+        reason,
+        reasonDescription
+    }: { reason?: string; reasonDescription?: string } = {}): void {
+        // @ts-ignore
+        const activeMap: Map<string, any> = this.p2pSessions as any;
+        const session = activeMap.get(remoteJid);
+
+        if (!session) {
+            return;
+        }
+        try {
+            session.terminate({
+                reason: reason || 'success',
+                reasonDescription: reasonDescription || 'mesh session terminated'
+            });
+        } catch (e) {
+            logger.warn('Mesh: terminate error ignored', e);
+        } finally {
+            activeMap.delete(remoteJid);
         }
     }
 
@@ -2132,7 +2307,7 @@ export default class JitsiConference extends Listenable {
         const removePromises = [];
 
         if (track.conference === this) {
-            if (this.jvbJingleSession) {
+            if (this.jvbJingleSession && !(this._isMeshEnabled && this._isMeshEnabled())) {
                 removePromises.push(this.jvbJingleSession.removeTrackFromPc(track));
             } else {
                 logger.debug('Remove local MediaStream - no JVB JingleSession started yet');
@@ -2141,6 +2316,14 @@ export default class JitsiConference extends Listenable {
                 removePromises.push(this.p2pJingleSession.removeTrackFromPc(track));
             } else {
                 logger.debug('Remove local MediaStream - no P2P JingleSession started yet');
+            }
+            // Mesh: удалить трек из всех активных p2p-сессий
+            if (this._isMeshEnabled && this._isMeshEnabled()) {
+                // @ts-ignore
+                const activeMap: Map<string, any> = this.p2pSessions as any;
+                for (const session of activeMap.values()) {
+                    removePromises.push(session.removeTrackFromPc(track));
+                }
             }
         }
 
@@ -2158,7 +2341,7 @@ export default class JitsiConference extends Listenable {
         const addPromises = [];
 
         if (track.conference === this) {
-            if (this.jvbJingleSession) {
+            if (this.jvbJingleSession && !(this._isMeshEnabled && this._isMeshEnabled())) {
                 addPromises.push(this.jvbJingleSession.addTrackToPc(track));
             } else {
                 logger.debug('Add local MediaStream - no JVB Jingle session started yet');
@@ -2168,6 +2351,14 @@ export default class JitsiConference extends Listenable {
                 addPromises.push(this.p2pJingleSession.addTrackToPc(track));
             } else {
                 logger.debug('Add local MediaStream - no P2P Jingle session started yet');
+            }
+            // Mesh: добавить трек во все активные p2p-сессии
+            if (this._isMeshEnabled && this._isMeshEnabled()) {
+                // @ts-ignore
+                const activeMap: Map<string, any> = this.p2pSessions as any;
+                for (const session of activeMap.values()) {
+                    addPromises.push(session.addTrackToPc(track));
+                }
             }
         } else {
             // If the track hasn't been added to the conference yet because of start muted by focus, add it to the
@@ -3621,6 +3812,15 @@ export default class JitsiConference extends Listenable {
         if (jingleSession.isP2P) {
             this._onIncomingCallP2P(jingleSession, jingleOffer);
         } else {
+            // Mesh: при активном mesh-режиме отбрасываем любые JVB-сессии
+            if (this._isMeshEnabled && this._isMeshEnabled()) {
+                this._rejectIncomingCall(jingleSession, {
+                    errorMsg: 'Mesh mode: rejecting JVB session-initiate',
+                    reason: 'service-unavailable',
+                    reasonDescription: 'mesh mode'
+                });
+                return;
+            }
             if (!this.isFocus(jingleSession.remoteJid)) {
                 const description = 'Rejecting session-initiate from non-focus.';
 
